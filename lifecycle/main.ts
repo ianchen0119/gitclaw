@@ -37,6 +37,7 @@ try {
 
   let mode = "new";
   let sessionPath = "";
+  let savedModel = "";
   const mappingFile = `state/issues/${issueNumber}.json`;
 
   if (existsSync(mappingFile)) {
@@ -44,6 +45,7 @@ try {
     if (existsSync(mapping.sessionPath)) {
       mode = "resume";
       sessionPath = mapping.sessionPath;
+      savedModel = mapping.model ?? "";
       console.log(`Found existing session: ${sessionPath}`);
     } else {
       console.log("Mapped session file missing, starting fresh");
@@ -56,31 +58,55 @@ try {
   await run(["git", "config", "user.name", "gitclaw[bot]"]);
   await run(["git", "config", "user.email", "gitclaw[bot]@users.noreply.github.com"]);
 
+  // --- Setup GitHub Copilot auth ---
+  const ghToken = process.env.COPILOT_GITHUB_TOKEN ?? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+  if (ghToken) {
+    const authDir = `${process.env.HOME}/.pi/agent`;
+    mkdirSync(authDir, { recursive: true });
+    writeFileSync(`${authDir}/auth.json`, JSON.stringify({
+      "github-copilot": { type: "oauth", refresh: ghToken, access: "", expires: 0 },
+    }, null, 2));
+  }
+
   // --- Build prompt ---
+  // Parse structured fields from GitHub issue form (### Section\n\ncontent)
+  const MODEL_WHITELIST = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$/;
+  let model = savedModel || "gpt-4o";
   let prompt: string;
+
   if (eventName === "issue_comment") {
     prompt = event.comment.body;
   } else {
-    prompt = `${title}\n\n${body}`;
+    // Try to extract ### Model and ### Task sections from issue form body
+    const modelSection = body.match(/^###\s*Model\s*\n+([\s\S]*?)(?=\n###|\s*$)/m);
+    const taskSection = body.match(/^###\s*Task\s*\n+([\s\S]*?)(?=\n###|\s*$)/m);
+    if (modelSection) {
+      const raw = modelSection[1].trim();
+      if (!raw.startsWith("(") && MODEL_WHITELIST.test(raw)) {
+        model = raw;
+      }
+    }
+    const taskBody = taskSection ? taskSection[1].trim() : body;
+    prompt = `${title}\n\n${taskBody}`;
   }
 
   // --- Run agent ---
-  const piArgs = ["bunx", "pi", "--mode", "json", "--session-dir", "./state/sessions", "-p", prompt];
+  const piArgs = ["bunx", "pi", "--provider", "github-copilot", "--model", model, "--mode", "json", "--session-dir", "./state/sessions", "-p", prompt];
   if (mode === "resume" && sessionPath) {
     piArgs.push("--session", sessionPath);
   }
 
-  const pi = Bun.spawn(piArgs, { stdout: "pipe", stderr: "ignore" });
+  const pi = Bun.spawn(piArgs, { stdout: "pipe", stderr: "inherit" });
   const tee = Bun.spawn(["tee", "/tmp/agent-raw.jsonl"], { stdin: pi.stdout, stdout: "inherit" });
   await tee.exited;
 
   // Extract text from the agent's final message
   const tac = Bun.spawn(["tac", "/tmp/agent-raw.jsonl"], { stdout: "pipe" });
   const jq = Bun.spawn(
-    ["jq", "-r", "-s", '[ .[] | select(.type == "message_end") ] | .[0].message.content[] | select(.type == "text") | .text'],
+    ["jq", "-r", "-s", '[ .[] | select(.type == "message_end") ] | if length > 0 then .[0].message.content[] | select(.type == "text") | .text else "" end'],
     { stdin: tac.stdout, stdout: "pipe" }
   );
-  const agentText = await new Response(jq.stdout).text();
+  const agentText = (await new Response(jq.stdout).text()).trim();
   await jq.exited;
 
   // Find latest session file
@@ -95,6 +121,7 @@ try {
       JSON.stringify({
         issueNumber,
         sessionPath: latestSession,
+        model,
         updatedAt: new Date().toISOString(),
       }, null, 2) + "\n"
     );
@@ -119,7 +146,11 @@ try {
 
   // --- Comment on issue ---
   const commentBody = agentText.slice(0, 60000);
-  await gh("issue", "comment", String(issueNumber), "--body", commentBody);
+  if (commentBody) {
+    await gh("issue", "comment", String(issueNumber), "--body", commentBody);
+  } else {
+    console.error("Warning: agent produced no text output, skipping comment");
+  }
 
 } finally {
   // --- Remove eyes reaction ---

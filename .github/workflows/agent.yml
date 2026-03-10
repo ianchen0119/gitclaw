@@ -10,6 +10,7 @@ permissions:
   contents: write
   issues: write
   actions: write
+  models: read
 
 jobs:
   run-agent:
@@ -43,6 +44,7 @@ jobs:
 
       - name: Run
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: bun lifecycle/main.ts
